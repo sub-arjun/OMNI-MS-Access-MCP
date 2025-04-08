@@ -1,0 +1,121 @@
+import pyodbc
+import os
+import json
+
+from mcp.server.fastmcp import FastMCP
+
+class AccessMCP:
+    def __init__(self, db_path):
+        """Initialize MS Access MCP Server
+        
+        Args:
+            db_path: Path to the Access database file (.accdb or .mdb)
+        """
+        # Verify the database exists
+        if not os.path.exists(db_path):
+            raise FileNotFoundError(f"Database file not found at {db_path}")
+            
+        self.db_path = db_path
+        self.mcp = FastMCP("MS Access Explorer")
+        self._setup_tools()
+        
+    def _setup_tools(self):
+        """Set up MCP tools"""
+        
+        @self.mcp.resource("schema://main")
+        def get_schema() -> str:
+            """Provide the database schema as a resource"""
+            # Create a connection string
+            conn_str = (
+                r'DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};'
+                fr'DBQ={self.db_path};'
+            )
+            
+            # Establish the connection
+            conn = pyodbc.connect(conn_str)
+            cursor = conn.cursor()
+            
+            # Get table schema information
+            tables = []
+            for row in cursor.tables(tableType='TABLE'):
+                table_name = row.table_name
+                tables.append(f"Table: {table_name}")
+                # Get column information for each table
+                columns = cursor.columns(table=table_name)
+                for column in columns:
+                    tables.append(f"  - Column: {column.column_name}, Type: {column.type_name}")
+            
+            return "\n".join(tables)
+        
+        @self.mcp.tool()
+        def get_schema_tool(format: str = "text") -> str:
+            """Get the database schema
+            
+            Args:
+                format: Output format - 'text' or 'json'
+            """
+            # Create a connection string
+            conn_str = (
+                r'DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};'
+                fr'DBQ={self.db_path};'
+            )
+            
+            # Establish the connection
+            conn = pyodbc.connect(conn_str)
+            cursor = conn.cursor()
+            
+            if format.lower() == "json":
+                # Return schema as JSON
+                schema_data = {}
+                for row in cursor.tables(tableType='TABLE'):
+                    table_name = row.table_name
+                    schema_data[table_name] = []
+                    
+                    # Get column information for each table
+                    columns = cursor.columns(table=table_name)
+                    for column in columns:
+                        schema_data[table_name].append({
+                            "name": column.column_name,
+                            "type": column.type_name,
+                            "nullable": column.nullable,
+                            "size": column.column_size
+                        })
+                
+                return json.dumps(schema_data, indent=2)
+            else:
+                # Return schema as text (default)
+                tables = []
+                for row in cursor.tables(tableType='TABLE'):
+                    table_name = row.table_name
+                    tables.append(f"Table: {table_name}")
+                    
+                    # Get column information for each table
+                    columns = cursor.columns(table=table_name)
+                    for column in columns:
+                        nullable = "NULL" if column.nullable else "NOT NULL"
+                        tables.append(f"  - Column: {column.column_name}, Type: {column.type_name}({column.column_size}), {nullable}")
+                
+                return "\n".join(tables)
+        
+        @self.mcp.tool()
+        def query_data(sql: str) -> str:
+            """Execute SQL queries safely"""
+            # Create a connection string
+            conn_str = (
+                r'DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};'
+                fr'DBQ={self.db_path};'
+            )
+            
+            # Establish the connection
+            conn = pyodbc.connect(conn_str)
+            try:
+                cursor = conn.cursor()
+                result = cursor.execute(sql).fetchall()
+                conn.close()
+                return "\n".join(str(row) for row in result)
+            except Exception as e:
+                return f"Error: {str(e)}"
+    
+    def run(self):
+        """Run the MCP server"""
+        self.mcp.run() 
