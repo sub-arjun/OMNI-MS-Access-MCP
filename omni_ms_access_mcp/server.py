@@ -150,12 +150,13 @@ def list_databases() -> str:
 
 
 @mcp.tool()
-def get_schema_tool(database: str = None, format: str = "text") -> str:
-    """Get the database schema
+def get_schema_tool(database: str = None, format: str = "text", include_samples: bool = False) -> str:
+    """Get comprehensive database schema information for AI agents
     
     Args:
         database: Name of the database to query (uses default if not specified)
         format: Output format - 'text' or 'json'
+        include_samples: Whether to include sample data for each table (helps AI understand data patterns)
     """
     try:
         db_key, db_path = get_database_path(database)
@@ -172,46 +173,241 @@ def get_schema_tool(database: str = None, format: str = "text") -> str:
     conn = pyodbc.connect(conn_str)
     cursor = conn.cursor()
     
-    if format.lower() == "json":
-        # Return schema as JSON
-        schema_data = {
-            "database": db_key,
-            "path": db_path,
-            "description": databases[db_key]['description'],
-            "tables": {}
-        }
+    # Get comprehensive schema information
+    schema_info = {
+        "database": db_key,
+        "path": db_path,
+        "description": databases[db_key]['description'],
+        "tables": {},
+        "relationships": [],
+        "saved_queries": []
+    }
+    
+    try:
+        # Get all tables
+        tables = []
         for row in cursor.tables(tableType='TABLE'):
-            table_name = row.table_name
-            schema_data["tables"][table_name] = []
+            if not row.table_name.startswith('MSys'):  # Skip system tables
+                tables.append(row.table_name)
+        
+        # Process each table
+        for table_name in tables:
+            table_info = {
+                "columns": [],
+                "primary_keys": [],
+                "foreign_keys": [],
+                "indexes": [],
+                "sample_data": None,
+                "row_count": None
+            }
             
-            # Get column information for each table
+            # Get column information
             columns = cursor.columns(table=table_name)
             for column in columns:
-                schema_data["tables"][table_name].append({
+                col_info = {
                     "name": column.column_name,
                     "type": column.type_name,
+                    "size": column.column_size,
                     "nullable": column.nullable,
-                    "size": column.column_size
-                })
-        
-        return json.dumps(schema_data, indent=2)
-    else:
-        # Return schema as text (default)
-        tables = [f"Database: {db_key} ({db_path})"]
-        tables.append(f"Description: {databases[db_key]['description']}")
-        tables.append("=" * 50)
-        
-        for row in cursor.tables(tableType='TABLE'):
-            table_name = row.table_name
-            tables.append(f"\nTable: {table_name}")
+                    "default": getattr(column, 'column_def', None),
+                    "position": column.ordinal_position
+                }
+                table_info["columns"].append(col_info)
             
-            # Get column information for each table
-            columns = cursor.columns(table=table_name)
-            for column in columns:
-                nullable = "NULL" if column.nullable else "NOT NULL"
-                tables.append(f"  - Column: {column.column_name}, Type: {column.type_name}({column.column_size}), {nullable}")
+            # Get primary key information
+            try:
+                pk_columns = cursor.primaryKeys(table=table_name)
+                for pk in pk_columns:
+                    table_info["primary_keys"].append({
+                        "column": pk.column_name,
+                        "key_seq": pk.key_seq
+                    })
+            except:
+                pass
+            
+            # Get foreign key information
+            try:
+                fk_columns = cursor.foreignKeys(table=table_name)
+                for fk in fk_columns:
+                    table_info["foreign_keys"].append({
+                        "column": fk.fkcolumn_name,
+                        "references_table": fk.pktable_name,
+                        "references_column": fk.pkcolumn_name,
+                        "constraint_name": getattr(fk, 'fk_name', 'Unknown')
+                    })
+            except:
+                pass
+            
+            # Get table statistics
+            try:
+                count_result = cursor.execute(f"SELECT COUNT(*) FROM [{table_name}]").fetchone()
+                table_info["row_count"] = count_result[0] if count_result else 0
+            except:
+                table_info["row_count"] = "Unable to determine"
+            
+            # Get sample data if requested
+            if include_samples and table_info["row_count"] != 0:
+                try:
+                    sample_result = cursor.execute(f"SELECT TOP 3 * FROM [{table_name}]").fetchall()
+                    if sample_result:
+                        # Convert to list of dictionaries for better readability
+                        column_names = [col["name"] for col in table_info["columns"]]
+                        samples = []
+                        for row in sample_result:
+                            sample_row = {}
+                            for i, value in enumerate(row):
+                                if i < len(column_names):
+                                    # Convert to string for JSON serialization
+                                    sample_row[column_names[i]] = str(value) if value is not None else None
+                            samples.append(sample_row)
+                        table_info["sample_data"] = samples
+                except:
+                    table_info["sample_data"] = "Unable to retrieve sample data"
+            
+            schema_info["tables"][table_name] = table_info
         
-        return "\n".join(tables)
+        # Get saved queries/views (Access queries)
+        try:
+            query_tables = cursor.tables(tableType='VIEW')
+            for query_row in query_tables:
+                if not query_row.table_name.startswith('MSys'):
+                    query_info = {
+                        "name": query_row.table_name,
+                        "type": "VIEW/QUERY"
+                    }
+                    
+                    # Try to get column information for the query
+                    try:
+                        query_columns = cursor.columns(table=query_row.table_name)
+                        query_info["columns"] = []
+                        for col in query_columns:
+                            query_info["columns"].append({
+                                "name": col.column_name,
+                                "type": col.type_name
+                            })
+                    except:
+                        query_info["columns"] = "Unable to retrieve query columns"
+                    
+                    schema_info["saved_queries"].append(query_info)
+        except:
+            pass
+        
+        # Try to get relationship information from system tables
+        try:
+            # This may not work in all Access versions due to permissions
+            rel_query = """
+            SELECT 
+                r.szRelationship as relationship_name,
+                r.szTable as from_table,
+                r.szColumn as from_column,
+                r.szReferencedTable as to_table,
+                r.szReferencedColumn as to_column
+            FROM MSysRelationships r
+            """
+            rel_result = cursor.execute(rel_query).fetchall()
+            for rel in rel_result:
+                schema_info["relationships"].append({
+                    "name": rel[0],
+                    "from_table": rel[1],
+                    "from_column": rel[2],
+                    "to_table": rel[3],
+                    "to_column": rel[4]
+                })
+        except:
+            # If we can't access system tables, build relationships from foreign keys
+            relationships = {}
+            for table_name, table_info in schema_info["tables"].items():
+                for fk in table_info["foreign_keys"]:
+                    rel_key = f"{table_name}.{fk['column']} -> {fk['references_table']}.{fk['references_column']}"
+                    relationships[rel_key] = {
+                        "from_table": table_name,
+                        "from_column": fk['column'],
+                        "to_table": fk['references_table'],
+                        "to_column": fk['references_column']
+                    }
+            schema_info["relationships"] = list(relationships.values())
+        
+    except Exception as e:
+        schema_info["error"] = f"Error retrieving schema: {str(e)}"
+    
+    conn.close()
+    
+    if format.lower() == "json":
+        return json.dumps(schema_info, indent=2)
+    else:
+        # Return AI-friendly text format
+        output = []
+        output.append(f"DATABASE SCHEMA FOR AI AGENT")
+        output.append(f"Database: {db_key} ({db_path})")
+        output.append(f"Description: {databases[db_key]['description']}")
+        output.append("=" * 80)
+        
+        # Tables section
+        output.append(f"\nTABLES ({len(schema_info['tables'])} total):")
+        output.append("-" * 40)
+        
+        for table_name, table_info in schema_info["tables"].items():
+            output.append(f"\n📋 TABLE: {table_name}")
+            output.append(f"   Rows: {table_info['row_count']}")
+            
+            # Primary keys
+            if table_info["primary_keys"]:
+                pk_cols = [pk["column"] for pk in table_info["primary_keys"]]
+                output.append(f"   🔑 Primary Key: {', '.join(pk_cols)}")
+            
+            # Columns
+            output.append("   📊 Columns:")
+            for col in table_info["columns"]:
+                nullable = "NULL" if col["nullable"] else "NOT NULL"
+                default_info = f", Default: {col['default']}" if col['default'] else ""
+                output.append(f"      • {col['name']}: {col['type']}({col['size']}) {nullable}{default_info}")
+            
+            # Foreign keys
+            if table_info["foreign_keys"]:
+                output.append("   🔗 Foreign Keys:")
+                for fk in table_info["foreign_keys"]:
+                    output.append(f"      • {fk['column']} → {fk['references_table']}.{fk['references_column']}")
+            
+            # Sample data
+            if include_samples and table_info["sample_data"]:
+                output.append("   📋 Sample Data:")
+                if isinstance(table_info["sample_data"], list):
+                    for i, sample in enumerate(table_info["sample_data"][:2]):  # Show max 2 samples
+                        sample_str = ", ".join([f"{k}={v}" for k, v in sample.items() if v is not None])
+                        output.append(f"      Row {i+1}: {sample_str}")
+                else:
+                    output.append(f"      {table_info['sample_data']}")
+        
+        # Relationships section
+        if schema_info["relationships"]:
+            output.append(f"\n🔗 RELATIONSHIPS ({len(schema_info['relationships'])} total):")
+            output.append("-" * 40)
+            for rel in schema_info["relationships"]:
+                rel_name = rel.get('name', 'Unnamed')
+                output.append(f"   {rel['from_table']}.{rel['from_column']} → {rel['to_table']}.{rel['to_column']}")
+        
+        # Saved queries section
+        if schema_info["saved_queries"]:
+            output.append(f"\n💾 SAVED QUERIES/VIEWS ({len(schema_info['saved_queries'])} total):")
+            output.append("-" * 40)
+            for query in schema_info["saved_queries"]:
+                output.append(f"   📝 {query['name']} ({query['type']})")
+                if isinstance(query['columns'], list):
+                    col_names = [col['name'] for col in query['columns']]
+                    output.append(f"      Columns: {', '.join(col_names)}")
+        
+        # AI Tips section
+        output.append(f"\n🤖 AI QUERY TIPS:")
+        output.append("-" * 40)
+        output.append("• Use square brackets around table/column names: [TableName], [Column Name]")
+        output.append("• Access uses different syntax: Use & for string concatenation, not +")
+        output.append("• For dates, use # delimiters: WHERE [DateField] = #2023-01-01#")
+        output.append("• Primary keys are ideal for WHERE clauses and JOINs")
+        output.append("• Use foreign key relationships shown above for proper JOINs")
+        if schema_info["saved_queries"]:
+            output.append("• Consider using saved queries/views as they may have complex logic")
+        
+        return "\n".join(output)
 
 
 @mcp.tool()
