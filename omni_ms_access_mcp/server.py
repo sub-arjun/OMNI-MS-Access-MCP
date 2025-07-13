@@ -634,15 +634,21 @@ def validate_cross_db_syntax(sql: str, databases: dict) -> tuple[bool, str]:
     return True, "OK"
 
 def rewrite_cross_db_query(sql: str, databases: dict, primary_db: str) -> str:
-    for other_db_key, db_info in databases.items():
-        path = db_info['path']
-        pattern = r'\[' + re.escape(other_db_key) + r'\]\.\[([^\]]+)\]'
-        if other_db_key == primary_db:
-            replacement = r'[\1]'
+    def replace_table_ref(match):
+        db_key = match.group(1)
+        table_name = match.group(2)
+        
+        if db_key == primary_db:
+            return '[' + table_name + ']'
         else:
-            replacement = f'[\\1] IN \'{path}\''
-        sql = re.sub(pattern, replacement, sql)
-    return sql
+            # Get the path and escape backslashes for Access
+            db_path = databases[db_key]['path']
+            # Use string concatenation to avoid f-string Unicode escape issues
+            return '[' + table_name + '] IN \'' + db_path + '\''
+    
+    # Pattern to match [db_name].[table_name]
+    pattern = r'\[([^\]]+)\]\.\[([^\]]+)\]'
+    return re.sub(pattern, replace_table_ref, sql)
 
 def create_sse_server():
     """Create a Starlette app that handles SSE connections"""
