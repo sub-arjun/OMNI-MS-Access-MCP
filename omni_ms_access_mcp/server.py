@@ -12,8 +12,8 @@ from mcp.server import NotificationOptions, Server
 from mcp.server.stdio import stdio_server
 from mcp.server.sse import SseServerTransport
 from starlette.applications import Starlette
-from starlette.middleware.cors import CORSMiddleware
 from starlette.routing import Mount, Route
+from starlette.middleware.cors import CORSMiddleware
 import uvicorn
 import re
 
@@ -29,19 +29,6 @@ parser.add_argument('--transport', default='stdio', choices=['stdio', 'sse'], he
 parser.add_argument('--host', default='127.0.0.1', help='Host for SSE (default: 127.0.0.1)')
 parser.add_argument('--port', type=int, default=8000, help='Port for SSE (default: 8000)')
 parser.add_argument('--path', default='/sse', help='Path for SSE endpoint (default: /sse)')
-
-# CORS configuration arguments
-parser.add_argument('--cors-origins', type=str, nargs='*', default=['*'], 
-                   help='Allowed CORS origins (default: ["*"]). Use multiple values for specific origins.')
-parser.add_argument('--cors-methods', type=str, nargs='*', default=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], 
-                   help='Allowed CORS methods (default: ["GET", "POST", "PUT", "DELETE", "OPTIONS"])')
-parser.add_argument('--cors-headers', type=str, nargs='*', default=['*'], 
-                   help='Allowed CORS headers (default: ["*"])')
-parser.add_argument('--cors-credentials', action='store_true', default=False,
-                   help='Allow credentials in CORS requests (default: False)')
-parser.add_argument('--disable-cors', action='store_true', default=False,
-                   help='Disable CORS middleware entirely (default: False)')
-
 args = parser.parse_args()
 
 # Get the database paths
@@ -198,45 +185,69 @@ async def handle_list_tools() -> list[types.Tool]:
             name="query_data",
             description="""Execute SQL queries across multiple Microsoft Access databases with automatic cross-database JOIN support.
 
-CRITICAL REQUIREMENTS (Always follow these):
-1. ALWAYS use [database_name].[table_name] syntax for ALL tables - even for single database queries
-2. Use Microsoft Access SQL dialect - NOT standard SQL
+⚠️ CRITICAL CONSTRAINTS (Access has strict limitations):
 
-ACCESS SQL SYNTAX RULES:
-• Square brackets: [TableName], [Column Name] - around ALL names, even without spaces
-• Date literals: #2023-01-01# - use # delimiters, not quotes
-• String concatenation: & - not + (e.g., [FirstName] & ' ' & [LastName])
-• Conditionals: IIF(condition, true_value, false_value) - not IF() or CASE
-• Limit results: TOP N - not LIMIT (e.g., SELECT TOP 10 ...)
-• Boolean values: 0/1 - not True/False (e.g., WHERE [Active] = 1)
-• Type conversion: Use CInt(), CDbl(), CStr() - not CAST() function
+1. DATABASE PREFIX REQUIREMENT:
+   - ALWAYS use [database_name].[table_name] syntax for ALL tables
+   - Example: FROM [sales_db].[customers] not FROM customers
+   - Missing prefixes will cause "table not found" errors
 
-CROSS-DATABASE EXAMPLES:
-Simple: SELECT [field] FROM [db1].[table1] WHERE [date] > #2024-01-01#
-Union: SELECT [id] FROM [db1].[customers] UNION ALL SELECT [id] FROM [db2].[vendors]  
-Filter: SELECT TOP 10 [name] FROM [db1].[table1] WHERE [status] = 1 ORDER BY [date] DESC
+2. CROSS-DATABASE JOIN LIMITATIONS:
+   - Direct JOINs between databases often fail with cryptic errors
+   - Access IN clause limited to 255 elements maximum
+   - Complex JOINs across databases may timeout or return incorrect results
+   - WORKAROUND: Use WHERE clause instead of JOIN syntax
 
-AVOID (These will cause errors):
-- Missing database prefixes: FROM [table1] ❌
-- Standard SQL syntax: LIMIT 10 ❌
-- Wrong date format: WHERE date > '2023-01-01' ❌
-- Wrong boolean: WHERE active = True ❌
-- Standard concatenation: firstname + ' ' + lastname ❌
+3. ACCESS SQL DIALECT CONSTRAINTS:
+   - Square brackets: [TableName], [Column Name] - REQUIRED around ALL names
+   - Date literals: #2023-01-01# - MUST use # delimiters, not quotes
+   - String concatenation: & operator - NOT + (will cause type errors)
+   - Conditionals: IIF(condition, true_val, false_val) - NOT CASE WHEN
+   - Limit results: TOP N - NOT LIMIT (unsupported function)
+   - Boolean values: 1/0 or -1/0 - NOT True/False (will cause parameter errors)
+   - Type conversion: CInt(), CDbl(), CStr() - NOT CAST() (unsupported)
 
-The system automatically converts cross-database references to Access IN clause syntax.""",
+4. PERFORMANCE CONSTRAINTS:
+   - File size limit: 2GB maximum per database
+   - Record limit: ~1-2 million records per table (performance degrades)
+   - Query timeout: Complex queries may timeout after 30 seconds
+   - Memory limit: Large result sets can cause out-of-memory errors
+   - Concurrent users: Maximum 5-10 simultaneous connections
+
+5. DATA TYPE CONSTRAINTS:
+   - Text fields: 255 character limit (use Memo for longer text)
+   - Number precision: Currency vs Double precision differences
+   - Date range: Years 100-9999 only
+   - Boolean inconsistency: Some tables use 1/0, others use -1/0
+   - Unicode issues: Older databases may have encoding problems
+
+WORKING EXAMPLES:
+✅ Simple cross-DB: SELECT TOP 10 [name] FROM [db1].[customers] WHERE [active] = 1
+✅ Cross-DB WHERE: SELECT * FROM [db1].[orders] AS [o], [db2].[customers] AS [c] WHERE [o].[cust_id] = [c].[id]
+✅ Cross-DB UNION: SELECT [name] FROM [db1].[customers] UNION ALL SELECT [name] FROM [db2].[vendors]
+
+PROBLEMATIC PATTERNS:
+❌ Direct JOIN: FROM [db1].[table1] JOIN [db2].[table2] ON [condition]
+❌ Standard SQL: SELECT * FROM table1 LIMIT 10 WHERE date > '2024-01-01'
+❌ Wrong types: WHERE active = True AND amount > CAST(field AS INT)
+
+The system converts [database].[table] references to Access IN clause syntax automatically.""",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "sql": {
                         "type": "string",
-                        "description": """SQL query using [database].[table] prefixes for ALL tables. 
-                
-TEMPLATE: SELECT [field1], [field2] FROM [database_name].[table_name] WHERE [field3] > #2024-01-01#
+                        "description": """SQL query using [database].[table] prefixes for ALL tables with Access SQL syntax.
 
-EXAMPLES:
-- Single DB: SELECT TOP 5 [Name] FROM [sales_db].[Customers] WHERE [Balance] > 1000
-- Cross-DB: SELECT [c].[Name], [o].[Amount] FROM [sales_db].[Customers] AS [c] JOIN [orders_db].[Orders] AS [o] ON [c].[ID] = [o].[CustomerID]
-- Union: SELECT [Name] FROM [db1].[Table1] UNION ALL SELECT [Name] FROM [db2].[Table2]""",
+MANDATORY TEMPLATE: SELECT [field1], [field2] FROM [database_name].[table_name] WHERE [field3] > #2024-01-01#
+
+CONSTRAINT EXAMPLES:
+- Cross-DB WHERE: SELECT [c].[name], [o].[total] FROM [sales_db].[customers] AS [c], [orders_db].[orders] AS [o] WHERE [c].[id] = [o].[customer_id]
+- Date filtering: WHERE [order_date] > #2024-01-01# AND [order_date] < #2024-12-31#
+- Boolean check: WHERE [active] = 1 AND [deleted] = 0
+- String concat: SELECT [first_name] & ' ' & [last_name] AS [full_name]
+- Type conversion: WHERE CInt([text_field]) > 100
+- Conditional: SELECT IIF([balance] > 1000, 'High', 'Low') AS [category]""",
                     },
                 },
                 "required": ["sql"],
@@ -580,6 +591,16 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[
                 output.append("• For queries across multiple databases, use [db_name].[TableName] syntax")
                 output.append("• Access SQL differences: Use TOP N (not LIMIT), # for dates, & for string concat, IIF() for conditionals")
                 output.append("• Boolean fields typically use 1/0 instead of True/False")
+                
+                output.append("\n⚠️ CRITICAL CONSTRAINTS:")
+                output.append("• Cross-database JOINs often fail - use WHERE clause instead")
+                output.append("• Text fields limited to 255 chars (use Memo for longer)")
+                output.append("• Date range: Years 100-9999 only")
+                output.append("• No CAST(), CASE WHEN, LIMIT - use Access equivalents")
+                output.append("• Database files limited to 2GB maximum")
+                output.append("• Performance degrades with >100k records")
+                output.append("• Boolean inconsistency: some tables use 1/0, others -1/0")
+                
                 output.append("\nRECOMMENDED WORKFLOW:")
                 output.append("1. START: Use list_databases to see available databases")
                 output.append("2. EXPLORE: Use get_schema_tool for each relevant database")
@@ -587,6 +608,7 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[
                 output.append("4. VALIDATE: Use validate_query_syntax to check before executing")
                 output.append("5. EXECUTE: Use query_data with proper [database].[table] syntax")
                 output.append("6. TROUBLESHOOT: If errors occur, the tool provides specific guidance")
+                output.append("7. CONSTRAINTS: Use query_limitations to understand Access limitations")
                 
                 result = "\n".join(output)
     
@@ -604,18 +626,6 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[
                 db_path = databases[db_key]['path']
                 
                 rewritten_sql = rewrite_cross_db_query(sql, databases, db_key)
-                
-                # Initialize result for potential warnings
-                result = ""
-                
-                # Performance check
-                if not "TOP " in sql.upper() and not "WHERE " in sql.upper():
-                    # Quick warning without counting
-                    result = "⚠️ PERFORMANCE WARNING: Query has no TOP or WHERE clause!\n"
-                    result += "This may return large datasets slowly. Consider:\n"
-                    result += "• Adding TOP N to limit results\n"
-                    result += "• Adding WHERE conditions to filter data\n"
-                    result += "• Run query_limitations with topic='performance' for optimization tips\n\n"
                 
                 conn_str = (
                     r'DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};'
@@ -638,8 +648,7 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[
                     output_lines.append("-" * 40)
                     output_lines.extend(str(row) for row in query_result)
                     
-                    # Append query results to any warnings
-                    result += "\n".join(output_lines)
+                    result = "\n".join(output_lines)
                     
                 except pyodbc.Error as e:
                     error_msg = str(e)
@@ -905,17 +914,6 @@ Note: Some Access tables may use -1 for True, check your data!"""
         if "CASE " in sql.upper():
             validation_errors.append("❌ Use IIF() instead of CASE statements")
         
-        # Check for problematic cross-database JOINs
-        if "JOIN" in sql.upper():
-            # Count unique database prefixes
-            db_prefixes = set(re.findall(r'\[([^\]]+)\]\.\[', sql))
-            if len(db_prefixes) > 1:
-                warnings.append("⚠️ Cross-database JOINs may fail. Consider using WHERE clause or UNION instead. Run query_limitations tool with topic='joins' for workarounds.")
-        
-        # Check for performance issues
-        if not "TOP " in sql.upper() and not "WHERE " in sql.upper():
-            warnings.append("⚠️ Query has no TOP or WHERE clause - may return large datasets slowly")
-        
         # Build result
         if validation_errors:
             result = "VALIDATION FAILED:\n\n" + "\n".join(validation_errors)
@@ -938,148 +936,457 @@ Note: Some Access tables may use -1 for True, check your data!"""
         
         limitations = {
             "joins": """
-🔗 CROSS-DATABASE JOIN LIMITATIONS:
+🔗 CROSS-DATABASE JOIN CONSTRAINTS:
 
-❌ WHAT DOESN'T WORK WELL:
-• Direct JOINs between tables in different databases often fail
-• Complex multi-table JOINs across databases
-• LEFT/RIGHT JOINs with cross-database tables
+❌ HARD LIMITATIONS:
+• Direct JOINs between databases fail with cryptic errors like "'c'" or "parameter missing"
+• Access IN clause limited to 255 elements maximum
+• LEFT/RIGHT JOINs across databases not supported
+• Complex multi-table JOINs across databases cause timeouts
+• Subqueries with JOINs across databases often fail
+• No support for FULL OUTER JOINs
 
-✅ WORKAROUNDS:
-1. Use WHERE clause instead of JOIN:
-   SELECT * FROM [db1].[table1] AS [t1], [db2].[table2] AS [t2]
-   WHERE [t1].[id] = [t2].[id]
+🔍 WHY JOINS FAIL:
+• Access query engine can't resolve table aliases across different .mdb/.accdb files
+• Cross-database table references use IN clause internally, which has element limits
+• Access assumes all tables in a JOIN are in the same database file
+• Query optimizer doesn't handle cross-database execution plans well
 
-2. Use UNION to combine results:
-   SELECT [id], [name] FROM [db1].[customers]
+✅ PROVEN WORKAROUNDS:
+1. WHERE clause (most reliable):
+   SELECT * FROM [db1].[customers] AS [c], [db2].[orders] AS [o] 
+   WHERE [c].[id] = [o].[customer_id]
+
+2. Separate queries + application logic:
+   Query 1: SELECT * FROM [db1].[customers] WHERE [active] = 1
+   Query 2: SELECT * FROM [db2].[orders] WHERE [customer_id] IN (results from Query 1)
+
+3. UNION for combining data:
+   SELECT [name], 'Customer' AS [type] FROM [db1].[customers]
    UNION ALL
-   SELECT [id], [name] FROM [db2].[vendors]
+   SELECT [name], 'Vendor' AS [type] FROM [db2].[vendors]
 
-3. Query databases separately and combine in application code
+4. Subquery approach (limited):
+   SELECT * FROM [db1].[customers] 
+   WHERE [id] IN (SELECT [customer_id] FROM [db2].[orders])
 
-⚡ BEST PRACTICE: Keep related data in the same database when possible""",
+⚠️ CONSTRAINT SPECIFICS:
+• Maximum 255 elements in IN clause
+• No correlated subqueries across databases
+• Aliases must be unique across all referenced databases
+• Performance degrades exponentially with multiple cross-DB references""",
 
             "performance": """
-⚡ PERFORMANCE LIMITATIONS:
+⚡ PERFORMANCE CONSTRAINTS:
 
-DATABASE SIZE LIMITS:
-• .mdb files: 2GB maximum
-• .accdb files: 2GB maximum
-• Practical limit: 1-2 million records per table
+📊 HARD LIMITS:
+• Database file size: 2GB maximum (.mdb and .accdb)
+• Table record limit: ~2 million records (theoretical), ~500k practical
+• Query timeout: 30 seconds default, 60 seconds maximum
+• Memory usage: ~2GB per connection (32-bit Access driver)
+• Concurrent connections: 5-10 maximum before lock contention
+• Field size: 255 chars (Text), 65,535 chars (Memo)
 
-QUERY PERFORMANCE EXPECTATIONS:
-• Simple SELECT (<10k records): Fast (<1 sec)
-• Cross-DB UNION (<50k records): Moderate (1-5 sec)
-• Complex WHERE (<100k records): Slow (5-30 sec)
-• Large aggregation (>100k records): Very slow (30+ sec)
+🐌 PERFORMANCE DEGRADATION POINTS:
+• Tables >100k records: Noticeable slowdown
+• Cross-DB queries >50k records: Significant slowdown (5-30 seconds)
+• Complex WHERE clauses >1M records: Often timeout
+• UNION operations >100k total records: Memory issues
+• Text searches without indexes: Extremely slow
 
-✅ OPTIMIZATION TIPS:
-1. Always use WHERE clauses to limit data
-2. Create indexes on frequently queried fields
-3. Use TOP N to limit result sets
-4. Break large queries into smaller chunks
-5. Avoid SELECT * - specify only needed columns
+📈 QUERY PERFORMANCE EXPECTATIONS:
+┌─────────────────────┬──────────────┬─────────────────┐
+│ Operation Type      │ Record Count │ Expected Time   │
+├─────────────────────┼──────────────┼─────────────────┤
+│ Simple SELECT       │ <10k         │ <1 second       │
+│ Filtered SELECT     │ <100k        │ 1-5 seconds     │
+│ Cross-DB WHERE      │ <50k         │ 5-15 seconds    │
+│ Cross-DB UNION      │ <100k        │ 10-30 seconds   │
+│ Complex aggregation │ >100k        │ 30+ seconds     │
+│ Text search (no idx)│ >10k         │ 30+ seconds     │
+└─────────────────────┴──────────────┴─────────────────┘
 
-⚠️ WARNING: Access is not suitable for high-volume transactions or real-time applications""",
+⚠️ MEMORY CONSTRAINTS:
+• Large result sets (>10k rows) can cause out-of-memory errors
+• Cross-database queries load entire result sets into memory
+• No streaming support for large datasets
+• 32-bit ODBC driver has 2GB memory limit per connection
+
+🚀 OPTIMIZATION STRATEGIES:
+1. Always use TOP N to limit results
+2. Add WHERE clauses to filter data early
+3. Create indexes on frequently queried columns
+4. Avoid SELECT * - specify only needed columns
+5. Break large queries into smaller chunks
+6. Use UNION ALL instead of UNION (faster)
+7. Avoid complex subqueries across databases
+8. Consider data archiving for tables >500k records
+
+🔧 INDEX CONSTRAINTS:
+• Maximum 32 indexes per table
+• Composite indexes limited to 10 fields
+• Index key size maximum 255 characters
+• No partial indexes or filtered indexes
+• No function-based indexes""",
 
             "data_types": """
-📊 DATA TYPE LIMITATIONS:
+📊 DATA TYPE CONSTRAINTS:
 
-COMMON TYPE ISSUES:
-• Boolean: Use 1/0 instead of True/False (some tables use -1 for True)
-• Dates: Must use #YYYY-MM-DD# format
-• Text: 255 char limit for Text fields, 65k for Memo
-• Numbers: Currency vs Decimal precision differences
+🔢 NUMERIC CONSTRAINTS:
+• Byte: 0 to 255 only
+• Integer: -32,768 to 32,767 (16-bit)
+• Long Integer: -2,147,483,648 to 2,147,483,647 (32-bit)
+• Single: 7 digits precision, scientific notation issues
+• Double: 15 digits precision, rounding errors common
+• Currency: 4 decimal places maximum, 15 digits before decimal
+• Decimal: 28 digits precision, but not supported in all Access versions
 
-ENCODING ISSUES:
-• Some older databases have UTF-16 encoding problems
-• Special characters in field names can cause errors
-• Mixed character sets across databases
+📅 DATE/TIME CONSTRAINTS:
+• Date range: January 1, 100 AD to December 31, 9999 AD
+• Time precision: Seconds only (no milliseconds)
+• Date format: Must use #YYYY-MM-DD# in queries
+• No timezone support
+• Year 2000 problem: 2-digit years interpreted as 1930-2029
 
-✅ SOLUTIONS:
-1. Standardize data types across databases
-2. Use conversion functions: CInt(), CDbl(), CStr(), CDate()
-3. Validate data before cross-database operations
-4. Test with sample data first""",
+📝 TEXT CONSTRAINTS:
+• Text field: 255 characters maximum
+• Memo field: 65,535 characters maximum (1GB theoretical)
+• No Unicode support in older .mdb files
+• Character encoding issues with special characters
+• No full-text search capabilities
+• Case-sensitive comparisons depend on database collation
+
+✅/❌ BOOLEAN CONSTRAINTS:
+• No native Boolean type
+• Yes/No field uses -1 for True, 0 for False
+• Some tables use 1 for True, 0 for False
+• Cannot use True/False literals in queries
+• Must use 1/0 or -1/0 in WHERE clauses
+
+🔄 TYPE CONVERSION CONSTRAINTS:
+• No CAST() function - use CInt(), CDbl(), CStr(), CDate()
+• Implicit conversions often fail
+• String to number conversion strict (no automatic trimming)
+• Date conversions depend on regional settings
+• No TRY_CAST equivalent - conversions fail with errors
+
+🌐 ENCODING ISSUES:
+• .mdb files: ANSI encoding (regional dependent)
+• .accdb files: UTF-16 encoding
+• Mixed encoding across databases causes corruption
+• Special characters (accents, symbols) may not display correctly
+• No support for multi-byte character sets in .mdb
+
+⚠️ COMMON TYPE ERRORS:
+• "Data type mismatch" - wrong boolean values (True/False vs 1/0)
+• "Invalid use of Null" - null values in calculations
+• "Overflow" - number too large for field type
+• "Type mismatch" - string/number conversion failures
+• "Parameter missing" - field name typos or wrong types in comparisons
+
+🔧 WORKAROUNDS:
+1. Standardize boolean representation across databases
+2. Use conversion functions explicitly: CInt([text_field])
+3. Handle nulls: IIF(IsNull([field]), 0, [field])
+4. Test data types: SELECT TypeName([field]) FROM [table]
+5. Use Memo fields for long text
+6. Validate data before cross-database operations""",
 
             "functions": """
-🔧 SQL FUNCTION LIMITATIONS:
+🔧 SQL FUNCTION CONSTRAINTS:
 
-❌ NOT SUPPORTED:
-• CAST() → Use CInt(), CDbl(), CStr()
-• LIMIT → Use TOP N
-• CASE WHEN → Use IIF()
-• || for concat → Use &
-• Window functions (ROW_NUMBER, PARTITION BY)
-• CTEs (Common Table Expressions)
-• MERGE statements
+❌ UNSUPPORTED STANDARD SQL:
+• CAST() - Use CInt(), CDbl(), CStr(), CDate() instead
+• CASE WHEN - Use IIF() for conditionals
+• LIMIT - Use TOP N in SELECT clause
+• OFFSET - Not supported at all
+• COALESCE() - Use IIF(IsNull(), alternative, value)
+• NULLIF() - Use IIF(field1 = field2, Null, field1)
+• ROW_NUMBER() - No window functions supported
+• PARTITION BY - No analytical functions
+• OVER() clause - Not supported
+• Common Table Expressions (CTEs) - Not supported
+• MERGE statements - Not supported
+• UPSERT operations - Not supported
 
-✅ ACCESS ALTERNATIVES:
-• Type conversion: CInt(), CDbl(), CStr(), CDate()
-• Conditionals: IIF(condition, true_val, false_val)
-• String ops: &, Left(), Right(), Mid(), InStr()
-• Date ops: DateAdd(), DateDiff(), Year(), Month()
-• Aggregates: COUNT(), SUM(), AVG(), MIN(), MAX()
+✅ ACCESS-SPECIFIC FUNCTIONS:
+• String functions: Left(), Right(), Mid(), InStr(), Len(), Trim()
+• Date functions: DateAdd(), DateDiff(), DatePart(), Year(), Month(), Day()
+• Conversion: CInt(), CDbl(), CStr(), CDate(), Val()
+• Conditional: IIF(condition, true_value, false_value)
+• Null handling: IsNull(), Nz() (null to zero)
+• Math: Abs(), Int(), Rnd(), Sgn(), Sqr()
+• Aggregate: Count(), Sum(), Avg(), Min(), Max(), First(), Last()
 
-EXAMPLE CONVERSIONS:
-• CAST(field AS INT) → CInt(field)
-• CASE WHEN x>10 THEN 'High' ELSE 'Low' END → IIF(x>10, 'High', 'Low')
-• firstname || ' ' || lastname → firstname & ' ' & lastname""",
+🔍 FUNCTION LIMITATIONS:
+• No user-defined functions in queries
+• No recursive functions
+• Limited string manipulation (no regex)
+• No JSON functions
+• No XML functions
+• No encryption/hashing functions
+• No array functions
+• No pivot/unpivot operations
+
+📊 AGGREGATE CONSTRAINTS:
+• No MEDIAN() function
+• No PERCENTILE functions
+• No statistical functions (STDDEV, VARIANCE)
+• GROUP BY limitations with Memo fields
+• HAVING clause limited functionality
+• No multiple grouping sets
+• No ROLLUP or CUBE operations
+
+🔤 STRING FUNCTION CONSTRAINTS:
+• No REGEXP or pattern matching
+• LIKE operator limited: * (any chars), ? (single char), # (single digit)
+• No SOUNDEX or phonetic matching
+• No string splitting functions
+• Concatenation only with & operator
+• No LTRIM/RTRIM - use Trim() only
+• No REPLACE() function in older versions
+
+📅 DATE FUNCTION CONSTRAINTS:
+• No DATEADD with custom intervals
+• DateDiff() limited to standard intervals (years, months, days, etc.)
+• No timezone conversion functions
+• No date formatting beyond basic Format() function
+• No ISO date functions
+• No business day calculations
+
+🔢 MATH FUNCTION CONSTRAINTS:
+• No advanced math functions (SIN, COS, TAN, LOG)
+• No POWER() function - use ^ operator
+• No ROUND() with precision control
+• No FLOOR()/CEILING() - use Int() and custom logic
+• No MOD() function - use Mod operator
+• No bitwise operations
+
+⚠️ FUNCTION ERROR PATTERNS:
+• "Function not recognized" - using standard SQL functions
+• "Wrong number of arguments" - Access function syntax differs
+• "Type mismatch" - function expects different data type
+• "Invalid use of Null" - function can't handle null values
+
+🔧 COMMON CONVERSIONS:
+┌─────────────────────┬─────────────────────────────────────┐
+│ Standard SQL        │ Access Equivalent                   │
+├─────────────────────┼─────────────────────────────────────┤
+│ CAST(x AS INT)      │ CInt(x)                            │
+│ CASE WHEN x THEN y  │ IIF(x, y, z)                       │
+│ LIMIT 10            │ TOP 10                             │
+│ COALESCE(x, y)      │ IIF(IsNull(x), y, x)               │
+│ SUBSTRING(x, 1, 5)  │ Left(x, 5) or Mid(x, 1, 5)        │
+│ LENGTH(x)           │ Len(x)                             │
+│ UPPER(x)            │ UCase(x)                           │
+│ LOWER(x)            │ LCase(x)                           │
+│ CONCAT(x, y)        │ x & y                              │
+│ NOW()               │ Now() or Date()                    │
+└─────────────────────┴─────────────────────────────────────┘""",
 
             "best_practices": """
-✨ BEST PRACTICES FOR ACCESS QUERIES:
+✨ ACCESS QUERY BEST PRACTICES:
 
-WHEN TO USE THIS TOOL:
-✅ Departmental reporting (small-medium datasets)
-✅ Data migration between systems
-✅ Ad-hoc analysis and quick insights
-✅ Prototyping and testing
+🎯 WHEN TO USE ACCESS:
+✅ Small to medium datasets (<500k records)
+✅ Departmental reporting and analysis
+✅ Data migration and transformation
+✅ Rapid prototyping and testing
 ✅ Legacy system integration
+✅ Single-user or small team environments
+✅ File-based data storage requirements
 
-WHEN NOT TO USE:
-❌ High-volume transactions
-❌ Real-time applications
+🚫 WHEN NOT TO USE ACCESS:
+❌ High-volume transactional systems
+❌ Real-time applications requiring <1 second response
 ❌ Multi-user systems (>10 concurrent users)
-❌ Critical business systems
-❌ Complex analytics
+❌ Mission-critical business systems
+❌ Complex analytical workloads
+❌ Systems requiring high availability
+❌ Applications needing advanced security
+❌ Big data or data warehouse scenarios
 
-GENERAL GUIDELINES:
-1. Always use [database].[table] syntax
-2. Test queries with small datasets first
-3. Use validate_query_syntax before executing
-4. Break complex operations into simple steps
-5. Keep backups of important databases
-6. Monitor file sizes (2GB limit)
-7. Use indexes on frequently queried fields
+📋 QUERY DESIGN PRINCIPLES:
+1. Always use [database].[table] syntax for clarity
+2. Start with simple queries, add complexity gradually
+3. Use TOP N to limit results during development
+4. Add WHERE clauses to filter data early
+5. Test with small datasets before scaling up
+6. Validate data types and null handling
+7. Use meaningful table aliases
+8. Comment complex queries for maintenance
 
-ERROR HANDLING:
-• Check query_builder_help for examples
-• Use get_schema_tool to verify table/column names
-• Run test_cross_db_connectivity for diagnostics
-• Start simple, add complexity gradually""",
+🔍 DEVELOPMENT WORKFLOW:
+1. **Discovery**: Use list_databases to see available data
+2. **Schema**: Use get_schema_tool to understand table structures
+3. **Planning**: Use query_builder_help for syntax examples
+4. **Validation**: Use validate_query_syntax before execution
+5. **Testing**: Start with TOP 10 and simple WHERE clauses
+6. **Optimization**: Add indexes and refine WHERE conditions
+7. **Documentation**: Document complex queries and their purpose
+
+⚠️ COMMON PITFALLS TO AVOID:
+• Forgetting [database].[table] prefixes
+• Using standard SQL syntax instead of Access dialect
+• Attempting complex JOINs across databases
+• Not handling null values properly
+• Ignoring data type constraints
+• Creating queries without WHERE clauses
+• Using SELECT * in production queries
+• Not testing with realistic data volumes
+
+🚀 PERFORMANCE OPTIMIZATION:
+1. **Indexing Strategy**:
+   - Create indexes on frequently queried columns
+   - Use composite indexes for multi-column WHERE clauses
+   - Avoid over-indexing (max 32 per table)
+
+2. **Query Optimization**:
+   - Use EXISTS instead of IN for subqueries
+   - Avoid functions in WHERE clauses
+   - Use UNION ALL instead of UNION when duplicates acceptable
+   - Break complex queries into simpler parts
+
+3. **Data Management**:
+   - Archive old data regularly
+   - Compact and repair databases monthly
+   - Monitor database file sizes
+   - Use appropriate data types
+
+🔧 ERROR HANDLING STRATEGY:
+1. **Proactive Validation**:
+   - Use validate_query_syntax before execution
+   - Check data types with get_schema_tool
+   - Test with small datasets first
+
+2. **Error Interpretation**:
+   - "Too few parameters" = field name typo or wrong data type
+   - "Syntax error in FROM clause" = cross-database JOIN issue
+   - "Reserved error" = unsupported function or complex query
+   - "Data type mismatch" = boolean or date format issue
+
+3. **Recovery Strategies**:
+   - Use query_limitations to understand constraints
+   - Simplify queries when errors occur
+   - Use alternative approaches (WHERE vs JOIN)
+   - Test individual components separately
+
+📊 MONITORING AND MAINTENANCE:
+• Monitor query execution times
+• Track database file sizes
+• Regular compact and repair operations
+• Backup databases before major changes
+• Document query patterns and performance
+• Plan for data growth and archiving
+
+🎓 LEARNING PROGRESSION:
+1. **Beginner**: Master basic SELECT with WHERE clauses
+2. **Intermediate**: Learn cross-database querying with constraints
+3. **Advanced**: Optimize complex queries and handle edge cases
+4. **Expert**: Design efficient data access patterns and troubleshoot issues
+
+💡 PRO TIPS:
+• Keep a reference of Access-specific functions handy
+• Use query_builder_help for syntax examples
+• Test all queries with realistic data volumes
+• Document workarounds for future reference
+• Plan database structure to minimize cross-database queries
+• Consider migrating to SQL Server for complex requirements""",
 
             "all": """
-📚 COMPLETE ACCESS LIMITATIONS REFERENCE:
+📚 COMPLETE ACCESS CONSTRAINTS REFERENCE:
 
-This tool has inherent limitations due to Microsoft Access architecture:
+This tool has fundamental limitations due to Microsoft Access architecture:
 
-1️⃣ CROSS-DATABASE JOINS: Limited support, use workarounds
-2️⃣ PERFORMANCE: 2GB file limit, slower with large datasets  
-3️⃣ DATA TYPES: Specific syntax requirements, encoding issues
-4️⃣ SQL FUNCTIONS: Limited dialect, no advanced features
-5️⃣ CONCURRENCY: Max 5-10 concurrent users
-6️⃣ PLATFORM: Windows-only, requires ODBC driver
-7️⃣ SECURITY: File-based, limited permissions model
-8️⃣ RELIABILITY: Prone to corruption, no auto-recovery
+🏗️ ARCHITECTURAL CONSTRAINTS:
+1️⃣ FILE-BASED SYSTEM: 2GB limit per database file
+2️⃣ SINGLE-THREADED: Limited concurrent access (5-10 users)
+3️⃣ 32-BIT ODBC: Memory limitations and compatibility issues
+4️⃣ WINDOWS-ONLY: Requires Microsoft Access ODBC driver
+5️⃣ NO TRANSACTIONS: Limited ACID compliance across databases
+6️⃣ LOCK GRANULARITY: Page-level locking causes contention
+7️⃣ NO CLUSTERING: Cannot distribute across multiple servers
+8️⃣ LIMITED BACKUP: No point-in-time recovery or hot backups
 
-For specific topics, use query_limitations with:
-• topic='joins' - Cross-database JOIN workarounds
+🔗 CROSS-DATABASE CONSTRAINTS:
+• Direct JOINs fail with cryptic errors
+• IN clause limited to 255 elements
+• No correlated subqueries across databases
+• Performance degrades exponentially with multiple DB references
+• Query optimizer not designed for cross-database operations
+
+⚡ PERFORMANCE CONSTRAINTS:
+• 2GB file size limit per database
+• ~500k practical record limit per table
+• 30-60 second query timeout limits
+• Memory-bound result sets (no streaming)
+• Exponential performance degradation with data growth
+
+📊 DATA TYPE CONSTRAINTS:
+• Text fields: 255 char limit (Memo: 65k chars)
+• No native Boolean type (uses -1/0 or 1/0)
+• Date range: Years 100-9999 only
+• No Unicode in .mdb files
+• Limited numeric precision and range
+
+🔧 SQL FUNCTION CONSTRAINTS:
+• No CAST(), CASE WHEN, LIMIT, window functions
+• No CTEs, MERGE, UPSERT operations
+• Limited string manipulation (no regex)
+• No advanced math or statistical functions
+• Access-specific dialect required
+
+🛡️ SECURITY CONSTRAINTS:
+• File-based permissions only
+• No row-level security
+• Weak database password protection
+• No encryption at rest
+• Limited audit capabilities
+
+🔄 CONCURRENCY CONSTRAINTS:
+• Optimistic locking only
+• No transaction isolation levels
+• Page-level locking causes contention
+• No deadlock detection
+• Limited concurrent write operations
+
+📈 SCALABILITY CONSTRAINTS:
+• Cannot scale horizontally
+• No load balancing capabilities
+• No partitioning support
+• No replication features
+• Single point of failure
+
+🎯 RECOMMENDED USAGE PATTERNS:
+✅ Small departmental databases (<100k records)
+✅ Read-heavy reporting workloads
+✅ Data migration and ETL processes
+✅ Prototyping and development
+✅ Single-user analytical work
+
+❌ AVOID FOR:
+❌ Production web applications
+❌ High-transaction systems
+❌ Multi-user concurrent access
+❌ Mission-critical systems
+❌ Large-scale data processing
+
+🔧 MITIGATION STRATEGIES:
+1. Design within constraints from the start
+2. Use appropriate data types and sizes
+3. Implement proper indexing strategies
+4. Plan for data archiving and cleanup
+5. Monitor performance and file sizes
+6. Have migration path to SQL Server ready
+
+For specific constraint details, use query_limitations with:
+• topic='joins' - Cross-database JOIN constraints
 • topic='performance' - Speed and size limitations
-• topic='data_types' - Type conversion and encoding
-• topic='functions' - SQL function alternatives
-• topic='best_practices' - When and how to use effectively
+• topic='data_types' - Type system constraints
+• topic='functions' - SQL function limitations
+• topic='best_practices' - How to work within constraints
 
-💡 TIP: Start with simple queries and gradually add complexity!"""
+💡 REMEMBER: These are not implementation bugs but fundamental Access limitations. Plan accordingly!"""
         }
         
         result = limitations.get(topic, "Unknown topic. Choose from: joins, performance, data_types, functions, best_practices, all")
@@ -1102,12 +1409,6 @@ def get_helpful_error_message(error_msg: str, sql: str) -> str:
             "• Table name misspelled or doesn't exist",
             "• Check if all databases in your query are accessible"
         ])
-        # Check if it's a cross-database JOIN issue
-        if "JOIN" in sql.upper() and len(set(re.findall(r'\[([^\]]+)\]\.\[', sql))) > 1:
-            guidance.append("⚠️ Cross-database JOINs often fail! Try:")
-            guidance.append("  - Use WHERE clause: FROM [db1].[t1], [db2].[t2] WHERE [t1].[id]=[t2].[id]")
-            guidance.append("  - Use UNION instead of JOIN")
-            guidance.append("  - Run query_limitations with topic='joins' for more workarounds")
     
     elif "Too few parameters" in error_msg:
         guidance.extend([
@@ -1117,7 +1418,6 @@ def get_helpful_error_message(error_msg: str, sql: str) -> str:
             "• Date format: Use #2024-01-01# not '2024-01-01'",
             "• Missing square brackets around field names with spaces"
         ])
-        guidance.append("💡 TIP: Use get_schema_tool to verify exact column names")
     
     elif "no read permission" in error_msg:
         guidance.extend([
@@ -1127,7 +1427,6 @@ def get_helpful_error_message(error_msg: str, sql: str) -> str:
             "• Table may not exist in the specified database",
             "• Try a different table or check database connectivity"
         ])
-        guidance.append("💡 TIP: Run test_cross_db_connectivity to diagnose access issues")
     
     elif "Reserved error" in error_msg:
         guidance.extend([
@@ -1137,31 +1436,16 @@ def get_helpful_error_message(error_msg: str, sql: str) -> str:
             "• Complex query too large for Access to process",
             "• Try simplifying the query or breaking it into parts"
         ])
-        guidance.append("💡 TIP: Run query_limitations with topic='functions' for Access alternatives")
-    
-    elif "Data type mismatch" in error_msg:
-        guidance.extend([
-            "❌ Data type mismatch:",
-            "• Boolean fields: Use 1/0 not True/False",
-            "• Dates: Use #YYYY-MM-DD# format",
-            "• Numbers: Check if field is Text that needs conversion",
-            "• Use conversion functions: CInt(), CDbl(), CStr(), CDate()"
-        ])
-        guidance.append("💡 TIP: Run query_limitations with topic='data_types' for more info")
     
     # Add query-specific suggestions
     if "CAST(" in sql.upper():
         guidance.append("💡 Try CInt(), CDbl(), or CStr() instead of CAST()")
     if "LIMIT " in sql.upper():
         guidance.append("💡 Use TOP N instead of LIMIT N")
-    if " + " in sql and ("'" in sql or '"' in sql):
+    if " + " in sql and "'" in sql:
         guidance.append("💡 Use & for string concatenation instead of +")
     if "True" in sql or "False" in sql:
         guidance.append("💡 Use 1/0 instead of True/False for boolean values")
-    
-    # Add performance warning for large queries
-    if not "TOP " in sql.upper() and not "WHERE " in sql.upper():
-        guidance.append("⚠️ Performance warning: Add TOP N or WHERE clause to limit results")
     
     return "\n".join(guidance)
 
@@ -1220,18 +1504,14 @@ def create_sse_server():
     
     app = Starlette(routes=routes)
     
-    # Add CORS middleware if not disabled
-    if not args.disable_cors:
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=args.cors_origins,
-            allow_credentials=args.cors_credentials,
-            allow_methods=args.cors_methods,
-            allow_headers=args.cors_headers,
-        )
-        print(f"CORS enabled with origins: {args.cors_origins}")
-    else:
-        print("CORS disabled")
+    # Add CORS middleware to allow cross-origin requests
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],  # Allow all origins
+        allow_credentials=True,
+        allow_methods=["*"],  # Allow all methods
+        allow_headers=["*", "Authorization"],  # Allow all headers including Authorization
+    )
     
     return app
 
