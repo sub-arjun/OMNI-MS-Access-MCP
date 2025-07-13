@@ -621,6 +621,29 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[
     
     return [types.TextContent(type="text", text=result)]
 
+def validate_cross_db_syntax(sql: str, databases: dict) -> tuple[bool, str]:
+    has_db_prefix = False
+    for db_key in databases.keys():
+        if f'[{db_key}].' in sql:
+            has_db_prefix = True
+            break
+    
+    if not has_db_prefix:
+        return False, "SQL must use [database_name].[table_name] prefixes for all tables to enable multi-DB support."
+    
+    return True, "OK"
+
+def rewrite_cross_db_query(sql: str, databases: dict, primary_db: str) -> str:
+    for other_db_key, db_info in databases.items():
+        path = db_info['path']
+        pattern = r'\[' + re.escape(other_db_key) + r'\]\.\[([^\]]+)\]'
+        if other_db_key == primary_db:
+            replacement = r'[\1]'
+        else:
+            replacement = r'[\1] IN \'' + path + '\''
+        sql = re.sub(pattern, replacement, sql)
+    return sql
+
 def create_sse_server():
     """Create a Starlette app that handles SSE connections"""
     transport = SseServerTransport("/messages")
