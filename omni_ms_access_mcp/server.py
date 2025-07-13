@@ -635,12 +635,12 @@ def validate_cross_db_syntax(sql: str, databases: dict) -> tuple[bool, str]:
 
 def rewrite_cross_db_query(sql: str, databases: dict, primary_db: str) -> str:
     for other_db_key, db_info in databases.items():
-        path = db_info['path'].replace('\\', '\\\\')
+        path = db_info['path']
         pattern = r'\[' + re.escape(other_db_key) + r'\]\.\[([^\]]+)\]'
         if other_db_key == primary_db:
             replacement = r'[\1]'
         else:
-            replacement = r'[\1] IN \'' + path + '\''
+            replacement = f'[\\1] IN \'{path}\''
         sql = re.sub(pattern, replacement, sql)
     return sql
 
