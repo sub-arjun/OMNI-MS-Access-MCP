@@ -12,6 +12,7 @@ from mcp.server import NotificationOptions, Server
 from mcp.server.stdio import stdio_server
 from mcp.server.sse import SseServerTransport
 from starlette.applications import Starlette
+from starlette.middleware.cors import CORSMiddleware
 from starlette.routing import Mount, Route
 import uvicorn
 import re
@@ -28,6 +29,19 @@ parser.add_argument('--transport', default='stdio', choices=['stdio', 'sse'], he
 parser.add_argument('--host', default='127.0.0.1', help='Host for SSE (default: 127.0.0.1)')
 parser.add_argument('--port', type=int, default=8000, help='Port for SSE (default: 8000)')
 parser.add_argument('--path', default='/sse', help='Path for SSE endpoint (default: /sse)')
+
+# CORS configuration arguments
+parser.add_argument('--cors-origins', type=str, nargs='*', default=['*'], 
+                   help='Allowed CORS origins (default: ["*"]). Use multiple values for specific origins.')
+parser.add_argument('--cors-methods', type=str, nargs='*', default=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], 
+                   help='Allowed CORS methods (default: ["GET", "POST", "PUT", "DELETE", "OPTIONS"])')
+parser.add_argument('--cors-headers', type=str, nargs='*', default=['*'], 
+                   help='Allowed CORS headers (default: ["*"])')
+parser.add_argument('--cors-credentials', action='store_true', default=False,
+                   help='Allow credentials in CORS requests (default: False)')
+parser.add_argument('--disable-cors', action='store_true', default=False,
+                   help='Disable CORS middleware entirely (default: False)')
+
 args = parser.parse_args()
 
 # Get the database paths
@@ -273,6 +287,21 @@ EXAMPLES:
                     }
                 },
                 "required": ["sql"]
+            }
+        ),
+        types.Tool(
+            name="query_limitations",
+            description="Get information about Access SQL limitations and workarounds for specific scenarios",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "enum": ["joins", "performance", "data_types", "functions", "best_practices", "all"],
+                        "description": "Specific limitation topic to learn about"
+                    }
+                },
+                "required": ["topic"]
             }
         ),
     ]
@@ -576,6 +605,18 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[
                 
                 rewritten_sql = rewrite_cross_db_query(sql, databases, db_key)
                 
+                # Initialize result for potential warnings
+                result = ""
+                
+                # Performance check
+                if not "TOP " in sql.upper() and not "WHERE " in sql.upper():
+                    # Quick warning without counting
+                    result = "⚠️ PERFORMANCE WARNING: Query has no TOP or WHERE clause!\n"
+                    result += "This may return large datasets slowly. Consider:\n"
+                    result += "• Adding TOP N to limit results\n"
+                    result += "• Adding WHERE conditions to filter data\n"
+                    result += "• Run query_limitations with topic='performance' for optimization tips\n\n"
+                
                 conn_str = (
                     r'DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};'
                     fr'DBQ={db_path};'
@@ -597,7 +638,8 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[
                     output_lines.append("-" * 40)
                     output_lines.extend(str(row) for row in query_result)
                     
-                    result = "\n".join(output_lines)
+                    # Append query results to any warnings
+                    result += "\n".join(output_lines)
                     
                 except pyodbc.Error as e:
                     error_msg = str(e)
@@ -863,6 +905,17 @@ Note: Some Access tables may use -1 for True, check your data!"""
         if "CASE " in sql.upper():
             validation_errors.append("❌ Use IIF() instead of CASE statements")
         
+        # Check for problematic cross-database JOINs
+        if "JOIN" in sql.upper():
+            # Count unique database prefixes
+            db_prefixes = set(re.findall(r'\[([^\]]+)\]\.\[', sql))
+            if len(db_prefixes) > 1:
+                warnings.append("⚠️ Cross-database JOINs may fail. Consider using WHERE clause or UNION instead. Run query_limitations tool with topic='joins' for workarounds.")
+        
+        # Check for performance issues
+        if not "TOP " in sql.upper() and not "WHERE " in sql.upper():
+            warnings.append("⚠️ Query has no TOP or WHERE clause - may return large datasets slowly")
+        
         # Build result
         if validation_errors:
             result = "VALIDATION FAILED:\n\n" + "\n".join(validation_errors)
@@ -879,6 +932,157 @@ Note: Some Access tables may use -1 for True, check your data!"""
         result += "\n• String concat: [FirstName] & ' ' & [LastName]"
         result += "\n• Conditionals: IIF([Price] > 100, 'Expensive', 'Affordable')"
         result += "\n• Limit: SELECT TOP 10 ..."
+    
+    elif name == "query_limitations":
+        topic = arguments.get("topic")
+        
+        limitations = {
+            "joins": """
+🔗 CROSS-DATABASE JOIN LIMITATIONS:
+
+❌ WHAT DOESN'T WORK WELL:
+• Direct JOINs between tables in different databases often fail
+• Complex multi-table JOINs across databases
+• LEFT/RIGHT JOINs with cross-database tables
+
+✅ WORKAROUNDS:
+1. Use WHERE clause instead of JOIN:
+   SELECT * FROM [db1].[table1] AS [t1], [db2].[table2] AS [t2]
+   WHERE [t1].[id] = [t2].[id]
+
+2. Use UNION to combine results:
+   SELECT [id], [name] FROM [db1].[customers]
+   UNION ALL
+   SELECT [id], [name] FROM [db2].[vendors]
+
+3. Query databases separately and combine in application code
+
+⚡ BEST PRACTICE: Keep related data in the same database when possible""",
+
+            "performance": """
+⚡ PERFORMANCE LIMITATIONS:
+
+DATABASE SIZE LIMITS:
+• .mdb files: 2GB maximum
+• .accdb files: 2GB maximum
+• Practical limit: 1-2 million records per table
+
+QUERY PERFORMANCE EXPECTATIONS:
+• Simple SELECT (<10k records): Fast (<1 sec)
+• Cross-DB UNION (<50k records): Moderate (1-5 sec)
+• Complex WHERE (<100k records): Slow (5-30 sec)
+• Large aggregation (>100k records): Very slow (30+ sec)
+
+✅ OPTIMIZATION TIPS:
+1. Always use WHERE clauses to limit data
+2. Create indexes on frequently queried fields
+3. Use TOP N to limit result sets
+4. Break large queries into smaller chunks
+5. Avoid SELECT * - specify only needed columns
+
+⚠️ WARNING: Access is not suitable for high-volume transactions or real-time applications""",
+
+            "data_types": """
+📊 DATA TYPE LIMITATIONS:
+
+COMMON TYPE ISSUES:
+• Boolean: Use 1/0 instead of True/False (some tables use -1 for True)
+• Dates: Must use #YYYY-MM-DD# format
+• Text: 255 char limit for Text fields, 65k for Memo
+• Numbers: Currency vs Decimal precision differences
+
+ENCODING ISSUES:
+• Some older databases have UTF-16 encoding problems
+• Special characters in field names can cause errors
+• Mixed character sets across databases
+
+✅ SOLUTIONS:
+1. Standardize data types across databases
+2. Use conversion functions: CInt(), CDbl(), CStr(), CDate()
+3. Validate data before cross-database operations
+4. Test with sample data first""",
+
+            "functions": """
+🔧 SQL FUNCTION LIMITATIONS:
+
+❌ NOT SUPPORTED:
+• CAST() → Use CInt(), CDbl(), CStr()
+• LIMIT → Use TOP N
+• CASE WHEN → Use IIF()
+• || for concat → Use &
+• Window functions (ROW_NUMBER, PARTITION BY)
+• CTEs (Common Table Expressions)
+• MERGE statements
+
+✅ ACCESS ALTERNATIVES:
+• Type conversion: CInt(), CDbl(), CStr(), CDate()
+• Conditionals: IIF(condition, true_val, false_val)
+• String ops: &, Left(), Right(), Mid(), InStr()
+• Date ops: DateAdd(), DateDiff(), Year(), Month()
+• Aggregates: COUNT(), SUM(), AVG(), MIN(), MAX()
+
+EXAMPLE CONVERSIONS:
+• CAST(field AS INT) → CInt(field)
+• CASE WHEN x>10 THEN 'High' ELSE 'Low' END → IIF(x>10, 'High', 'Low')
+• firstname || ' ' || lastname → firstname & ' ' & lastname""",
+
+            "best_practices": """
+✨ BEST PRACTICES FOR ACCESS QUERIES:
+
+WHEN TO USE THIS TOOL:
+✅ Departmental reporting (small-medium datasets)
+✅ Data migration between systems
+✅ Ad-hoc analysis and quick insights
+✅ Prototyping and testing
+✅ Legacy system integration
+
+WHEN NOT TO USE:
+❌ High-volume transactions
+❌ Real-time applications
+❌ Multi-user systems (>10 concurrent users)
+❌ Critical business systems
+❌ Complex analytics
+
+GENERAL GUIDELINES:
+1. Always use [database].[table] syntax
+2. Test queries with small datasets first
+3. Use validate_query_syntax before executing
+4. Break complex operations into simple steps
+5. Keep backups of important databases
+6. Monitor file sizes (2GB limit)
+7. Use indexes on frequently queried fields
+
+ERROR HANDLING:
+• Check query_builder_help for examples
+• Use get_schema_tool to verify table/column names
+• Run test_cross_db_connectivity for diagnostics
+• Start simple, add complexity gradually""",
+
+            "all": """
+📚 COMPLETE ACCESS LIMITATIONS REFERENCE:
+
+This tool has inherent limitations due to Microsoft Access architecture:
+
+1️⃣ CROSS-DATABASE JOINS: Limited support, use workarounds
+2️⃣ PERFORMANCE: 2GB file limit, slower with large datasets  
+3️⃣ DATA TYPES: Specific syntax requirements, encoding issues
+4️⃣ SQL FUNCTIONS: Limited dialect, no advanced features
+5️⃣ CONCURRENCY: Max 5-10 concurrent users
+6️⃣ PLATFORM: Windows-only, requires ODBC driver
+7️⃣ SECURITY: File-based, limited permissions model
+8️⃣ RELIABILITY: Prone to corruption, no auto-recovery
+
+For specific topics, use query_limitations with:
+• topic='joins' - Cross-database JOIN workarounds
+• topic='performance' - Speed and size limitations
+• topic='data_types' - Type conversion and encoding
+• topic='functions' - SQL function alternatives
+• topic='best_practices' - When and how to use effectively
+
+💡 TIP: Start with simple queries and gradually add complexity!"""
+        }
+        
+        result = limitations.get(topic, "Unknown topic. Choose from: joins, performance, data_types, functions, best_practices, all")
     
     else:
         result = f"Unknown tool: {name}"
@@ -898,6 +1102,12 @@ def get_helpful_error_message(error_msg: str, sql: str) -> str:
             "• Table name misspelled or doesn't exist",
             "• Check if all databases in your query are accessible"
         ])
+        # Check if it's a cross-database JOIN issue
+        if "JOIN" in sql.upper() and len(set(re.findall(r'\[([^\]]+)\]\.\[', sql))) > 1:
+            guidance.append("⚠️ Cross-database JOINs often fail! Try:")
+            guidance.append("  - Use WHERE clause: FROM [db1].[t1], [db2].[t2] WHERE [t1].[id]=[t2].[id]")
+            guidance.append("  - Use UNION instead of JOIN")
+            guidance.append("  - Run query_limitations with topic='joins' for more workarounds")
     
     elif "Too few parameters" in error_msg:
         guidance.extend([
@@ -907,6 +1117,7 @@ def get_helpful_error_message(error_msg: str, sql: str) -> str:
             "• Date format: Use #2024-01-01# not '2024-01-01'",
             "• Missing square brackets around field names with spaces"
         ])
+        guidance.append("💡 TIP: Use get_schema_tool to verify exact column names")
     
     elif "no read permission" in error_msg:
         guidance.extend([
@@ -916,6 +1127,7 @@ def get_helpful_error_message(error_msg: str, sql: str) -> str:
             "• Table may not exist in the specified database",
             "• Try a different table or check database connectivity"
         ])
+        guidance.append("💡 TIP: Run test_cross_db_connectivity to diagnose access issues")
     
     elif "Reserved error" in error_msg:
         guidance.extend([
@@ -925,16 +1137,31 @@ def get_helpful_error_message(error_msg: str, sql: str) -> str:
             "• Complex query too large for Access to process",
             "• Try simplifying the query or breaking it into parts"
         ])
+        guidance.append("💡 TIP: Run query_limitations with topic='functions' for Access alternatives")
+    
+    elif "Data type mismatch" in error_msg:
+        guidance.extend([
+            "❌ Data type mismatch:",
+            "• Boolean fields: Use 1/0 not True/False",
+            "• Dates: Use #YYYY-MM-DD# format",
+            "• Numbers: Check if field is Text that needs conversion",
+            "• Use conversion functions: CInt(), CDbl(), CStr(), CDate()"
+        ])
+        guidance.append("💡 TIP: Run query_limitations with topic='data_types' for more info")
     
     # Add query-specific suggestions
     if "CAST(" in sql.upper():
         guidance.append("💡 Try CInt(), CDbl(), or CStr() instead of CAST()")
     if "LIMIT " in sql.upper():
         guidance.append("💡 Use TOP N instead of LIMIT N")
-    if " + " in sql and "'" in sql:
+    if " + " in sql and ("'" in sql or '"' in sql):
         guidance.append("💡 Use & for string concatenation instead of +")
     if "True" in sql or "False" in sql:
         guidance.append("💡 Use 1/0 instead of True/False for boolean values")
+    
+    # Add performance warning for large queries
+    if not "TOP " in sql.upper() and not "WHERE " in sql.upper():
+        guidance.append("⚠️ Performance warning: Add TOP N or WHERE clause to limit results")
     
     return "\n".join(guidance)
 
@@ -991,7 +1218,22 @@ def create_sse_server():
         Mount("/messages", app=transport.handle_post_message),
     ]
     
-    return Starlette(routes=routes)
+    app = Starlette(routes=routes)
+    
+    # Add CORS middleware if not disabled
+    if not args.disable_cors:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=args.cors_origins,
+            allow_credentials=args.cors_credentials,
+            allow_methods=args.cors_methods,
+            allow_headers=args.cors_headers,
+        )
+        print(f"CORS enabled with origins: {args.cors_origins}")
+    else:
+        print("CORS disabled")
+    
+    return app
 
 async def run_stdio():
     """Run the server with stdio transport"""
