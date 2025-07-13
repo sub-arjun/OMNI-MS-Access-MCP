@@ -455,14 +455,14 @@ def run():
     run_kwargs = {}
     if args.transport != 'stdio':
         run_kwargs['transport'] = args.transport
-        run_kwargs['host'] = args.host
-        run_kwargs['port'] = args.port
-        if args.path:
-            run_kwargs['path'] = args.path
-        elif args.transport == 'sse':
-            run_kwargs['path'] = '/sse'
+        if args.transport == 'sse':
+            run_kwargs['sse_host'] = args.host
+            run_kwargs['sse_port'] = args.port
+            run_kwargs['sse_path'] = args.path if args.path else '/sse'
         elif args.transport == 'http':
-            run_kwargs['path'] = '/mcp'
+            run_kwargs['streamable_http_host'] = args.host
+            run_kwargs['streamable_http_port'] = args.port
+            run_kwargs['streamable_http_path'] = args.path if args.path else '/mcp'
     mcp.run(**run_kwargs)
 
 
