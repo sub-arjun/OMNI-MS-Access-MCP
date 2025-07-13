@@ -452,18 +452,22 @@ def query_data(sql: str, database: str = None) -> str:
 
 def run():
     """Run the MCP server with configured transport"""
-    run_kwargs = {}
-    if args.transport != 'stdio':
-        run_kwargs['transport'] = args.transport
-        if args.transport == 'sse':
-            run_kwargs['sse_host'] = args.host
-            run_kwargs['sse_port'] = args.port
-            run_kwargs['sse_path'] = args.path if args.path else '/sse'
+    if args.transport == 'stdio':
+        mcp.run()
+    else:
+        run_kwargs = {
+            'transport': args.transport,
+            'host': args.host,
+            'port': args.port
+        }
+        if args.path:
+            run_kwargs['path'] = args.path
+        elif args.transport == 'sse':
+            run_kwargs['path'] = '/sse'
         elif args.transport == 'http':
-            run_kwargs['streamable_http_host'] = args.host
-            run_kwargs['streamable_http_port'] = args.port
-            run_kwargs['streamable_http_path'] = args.path if args.path else '/mcp'
-    mcp.run(**run_kwargs)
+            run_kwargs['path'] = '/mcp'
+        
+        mcp.run(**run_kwargs)
 
 
 if __name__ == "__main__":
