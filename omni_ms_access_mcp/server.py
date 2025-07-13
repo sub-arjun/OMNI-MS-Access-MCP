@@ -14,6 +14,10 @@ parser.add_argument("--db-name", type=str, action='append', dest='db_names',
                    help="Friendly name for the database. Must match the order of --db-path arguments.")
 parser.add_argument("--db-desc", type=str, action='append', dest='db_descriptions',
                    help="Description for the database. Must match the order of --db-path arguments.")
+parser.add_argument('--transport', default='stdio', choices=['stdio', 'sse', 'http'], help='Transport method (default: stdio)')
+parser.add_argument('--host', default='127.0.0.1', help='Host for HTTP/SSE (default: 127.0.0.1)')
+parser.add_argument('--port', type=int, default=8000, help='Port for HTTP/SSE (default: 8000)')
+parser.add_argument('--path', default=None, help='Path for SSE/HTTP endpoint (default: /sse for SSE, /mcp for HTTP)')
 args = parser.parse_args()
 
 # Get the database paths
@@ -447,8 +451,19 @@ def query_data(sql: str, database: str = None) -> str:
 
 
 def run():
-    """Run the MCP server"""
-    mcp.run()
+    """Run the MCP server with configured transport"""
+    run_kwargs = {}
+    if args.transport != 'stdio':
+        run_kwargs['transport'] = args.transport
+        run_kwargs['host'] = args.host
+        run_kwargs['port'] = args.port
+        if args.path:
+            run_kwargs['path'] = args.path
+        elif args.transport == 'sse':
+            run_kwargs['path'] = '/sse'
+        elif args.transport == 'http':
+            run_kwargs['path'] = '/mcp'
+    mcp.run(**run_kwargs)
 
 
 if __name__ == "__main__":
