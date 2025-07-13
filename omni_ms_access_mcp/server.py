@@ -454,20 +454,16 @@ def run():
     """Run the MCP server with configured transport"""
     if args.transport == 'stdio':
         mcp.run()
+    elif args.transport == 'sse':
+        # For SSE transport, pass the path in the path parameter
+        path = args.path if args.path else '/sse'
+        mcp.run(transport='sse', host=args.host, port=args.port, path=path)
+    elif args.transport == 'http':
+        # For HTTP transport (streamable-http), pass the path in the path parameter
+        path = args.path if args.path else '/mcp'
+        mcp.run(transport='streamable-http', host=args.host, port=args.port, path=path)
     else:
-        run_kwargs = {
-            'transport': args.transport,
-            'host': args.host,
-            'port': args.port
-        }
-        if args.path:
-            run_kwargs['path'] = args.path
-        elif args.transport == 'sse':
-            run_kwargs['path'] = '/sse'
-        elif args.transport == 'http':
-            run_kwargs['path'] = '/mcp'
-        
-        mcp.run(**run_kwargs)
+        raise ValueError(f"Unsupported transport: {args.transport}")
 
 
 if __name__ == "__main__":
