@@ -182,16 +182,25 @@ async def handle_list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="query_data",
-            description="Execute SQL queries across multiple databases. ALWAYS use [database_name].[table_name] syntax for ALL tables to avoid ambiguity. This uses Microsoft Access SQL dialect - key rules: Use square brackets [ ] around ALL table/column names, even if no spaces. Use & for string concatenation (not +). Use # delimiters for dates: #YYYY-MM-DD#. Use IIF() for conditionals instead of IF(). No LIMIT; use TOP N instead. Example: SELECT TOP 10 [c].[CustomerName] FROM [mrpplus_be].[Customers] AS [c] JOIN [mrpplus_fin].[Invoices] AS [i] ON [c].[ID] = [i].[CustomerID] WHERE [i].[Date] > #2023-01-01# ORDER BY [i].[Amount] DESC. The query runs on the default database as primary, with automatic cross-DB joins via IN clauses.",
+            description="Execute SQL queries across multiple databases. ALWAYS use [database_name].[table_name] syntax for ALL tables. The system automatically converts cross-database references to Access IN clause syntax. Use Access SQL dialect: square brackets around names, # for dates (#2023-01-01#), & for string concatenation, IIF() for conditionals, TOP N instead of LIMIT. Example: SELECT [c].[Name] FROM [sales_db].[Customers] AS [c] JOIN [orders_db].[Orders] AS [o] ON [c].[ID] = [o].[CustomerID] WHERE [o].[Date] > #2023-01-01# ORDER BY [c].[Name]",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "sql": {
                         "type": "string",
-                        "description": "SQL query to execute, must use [db].[table] prefixes and follow Access SQL rules",
+                        "description": "SQL query using [database].[table] prefixes for all tables. Must follow Access SQL syntax rules.",
                     },
                 },
                 "required": ["sql"],
+            },
+        ),
+        types.Tool(
+            name="test_cross_db_connectivity",
+            description="Test connectivity to all databases and verify cross-database query capability. Helps diagnose connection and syntax issues.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
             },
         ),
     ]
@@ -481,41 +490,131 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[
         if not sql:
             result = "Error: SQL query is required"
         else:
-            db_key = default_db_key
-            db_path = databases[db_key]['path']
-            rewritten_sql = sql
-            for other_db_key, db_info in databases.items():
-                path = db_info['path'].replace('\\', '\\\\')
-                pattern = r'\[' + re.escape(other_db_key) + r'\]\.\[([^\]]+)\]'
-                if other_db_key == db_key:
-                    replacement = r'[\1]'
-                else:
-                    replacement = r'[\1] IN \'' + path + '\''
-                rewritten_sql = re.sub(pattern, replacement, rewritten_sql)
-            if rewritten_sql == sql:
-                result = "Error: SQL must use [db_name].[table_name] prefixes for all tables to enable multi-DB support."
+            is_valid, validation_msg = validate_cross_db_syntax(sql, databases)
+            if not is_valid:
+                result = f"Error: {validation_msg}"
             else:
-                # Create a connection string
+                db_key = default_db_key
+                db_path = databases[db_key]['path']
+                
+                rewritten_sql = rewrite_cross_db_query(sql, databases, db_key)
+                
                 conn_str = (
                     r'DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};'
                     fr'DBQ={db_path};'
+                    r'ExtendedAnsiSQL=1;'
                 )
                 
-                # Establish the connection
                 try:
-                    conn = pyodbc.connect(conn_str)
+                    conn = pyodbc.connect(conn_str, timeout=30)
                     cursor = conn.cursor()
+                    
+                    print(f"DEBUG - Original SQL: {sql}")
+                    print(f"DEBUG - Rewritten SQL: {rewritten_sql}")
+                    print(f"DEBUG - Primary DB: {db_key}")
+                    
                     query_result = cursor.execute(rewritten_sql).fetchall()
                     conn.close()
                     
-                    # Add database info to output
                     output_lines = [f"Query executed on primary database: {db_key} with cross-DB support"]
                     output_lines.append("-" * 40)
                     output_lines.extend(str(row) for row in query_result)
                     
                     result = "\n".join(output_lines)
+                    
+                except pyodbc.Error as db_error:
+                    error_code = getattr(db_error, 'args', ['Unknown'])[0]
+                    error_msg = str(db_error)
+                    
+                    result = f"Database Error ({error_code}): {error_msg}\n"
+                    result += f"Primary Database: {db_key}\n"
+                    result += f"Original SQL: {sql}\n"
+                    result += f"Rewritten SQL: {rewritten_sql}\n"
+                    
+                    if "Syntax error in FROM clause" in error_msg:
+                        result += "\nTROUBLESHOOTING: Check database path and IN clause syntax"
+                        result += f"\nVerify database paths exist:"
+                        for db_name, db_info in databases.items():
+                            exists = "✅" if os.path.exists(db_info['path']) else "❌"
+                            result += f"\n  {exists} {db_name}: {db_info['path']}"
+                    elif "Too few parameters" in error_msg:
+                        result += "\nTROUBLESHOOTING: Check field names and boolean comparisons"
+                        result += "\n  - Use 0/1 instead of True/False for boolean fields"
+                        result += "\n  - Verify all field names exist in the tables"
+                        result += "\n  - Check for typos in column names"
+                    elif "No such table" in error_msg or "does not exist" in error_msg:
+                        result += "\nTROUBLESHOOTING: Table name issue"
+                        result += "\n  - Verify table names are spelled correctly"
+                        result += "\n  - Check if table exists in the specified database"
+                
                 except Exception as e:
-                    result = f"Error querying database '{db_key}': {str(e)}\nOriginal SQL: {sql}\nRewritten SQL: {rewritten_sql}"
+                    result = f"General Error: {str(e)}\nOriginal SQL: {sql}\nRewritten SQL: {rewritten_sql}"
+    
+    elif name == "test_cross_db_connectivity":
+        test_results = []
+        test_results.append("Cross-Database Connectivity Test")
+        test_results.append("=" * 50)
+        
+        working_dbs = []
+        for db_key, db_info in databases.items():
+            try:
+                if not os.path.exists(db_info['path']):
+                    test_results.append(f"❌ {db_key}: File not found at {db_info['path']}")
+                    continue
+                    
+                conn_str = (
+                    r'DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};'
+                    fr'DBQ={db_info["path"]};'
+                )
+                conn = pyodbc.connect(conn_str, timeout=10)
+                
+                cursor = conn.cursor()
+                tables = [row.table_name for row in cursor.tables(tableType='TABLE') 
+                         if not row.table_name.startswith('MSys')]
+                
+                test_results.append(f"✅ {db_key}: Connected successfully ({len(tables)} tables)")
+                if tables:
+                    test_results.append(f"   Sample tables: {', '.join(tables[:3])}{'...' if len(tables) > 3 else ''}")
+                
+                working_dbs.append((db_key, tables[0] if tables else None))
+                conn.close()
+                
+            except Exception as e:
+                test_results.append(f"❌ {db_key}: Connection failed - {str(e)}")
+        
+        if len(working_dbs) >= 2:
+            test_results.append(f"\nTesting Cross-Database Query Rewriting:")
+            test_results.append("-" * 30)
+            
+            db1_key, db1_table = working_dbs[0]
+            db2_key, db2_table = working_dbs[1]
+            
+            if db1_table and db2_table:
+                test_sql = f"SELECT COUNT(*) FROM [{db1_key}].[{db1_table}] UNION ALL SELECT COUNT(*) FROM [{db2_key}].[{db2_table}]"
+                test_results.append(f"Original SQL: {test_sql}")
+                
+                rewritten = rewrite_cross_db_query(test_sql, databases, default_db_key)
+                test_results.append(f"Rewritten SQL: {rewritten}")
+                
+                test_results.append("\nTesting rewritten query execution...")
+                try:
+                    conn_str = (
+                        r'DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};'
+                        fr'DBQ={databases[default_db_key]["path"]};'
+                    )
+                    conn = pyodbc.connect(conn_str, timeout=10)
+                    cursor = conn.cursor()
+                    result = cursor.execute(rewritten).fetchall()
+                    test_results.append(f"✅ Cross-database query executed successfully!")
+                    test_results.append(f"   Results: {len(result)} rows returned")
+                    conn.close()
+                except Exception as e:
+                    test_results.append(f"❌ Cross-database query failed: {str(e)}")
+        else:
+            test_results.append(f"\nNeed at least 2 working databases to test cross-DB queries")
+            test_results.append(f"Currently have {len(working_dbs)} working database(s)")
+        
+        result = "\n".join(test_results)
     
     else:
         result = f"Unknown tool: {name}"
