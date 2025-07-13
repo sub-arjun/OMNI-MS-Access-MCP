@@ -14,6 +14,9 @@ from mcp.server.sse import SseServerTransport
 from starlette.applications import Starlette
 from starlette.routing import Mount, Route
 from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 import uvicorn
 import re
 
@@ -29,6 +32,8 @@ parser.add_argument('--transport', default='stdio', choices=['stdio', 'sse'], he
 parser.add_argument('--host', default='127.0.0.1', help='Host for SSE (default: 127.0.0.1)')
 parser.add_argument('--port', type=int, default=8000, help='Port for SSE (default: 8000)')
 parser.add_argument('--path', default='/sse', help='Path for SSE endpoint (default: /sse)')
+parser.add_argument('--cors-origin', default='*', help='CORS allowed origins (default: *)')
+parser.add_argument('--auth-header', type=str, help='Required Authorization header value for authentication')
 args = parser.parse_args()
 
 # Get the database paths
@@ -41,6 +46,7 @@ if not db_paths:
     print("Example: ms-access-mcp --db-path \"C:\\path\\to\\database1.accdb\" --db-path \"C:\\path\\to\\database2.accdb\"")
     print("With names: ms-access-mcp --db-path \"db1.accdb\" --db-name \"Sales\" --db-path \"db2.accdb\" --db-name \"Inventory\"")
     print("Full example: ms-access-mcp --db-path \"sales.accdb\" --db-name \"Sales\" --db-desc \"Sales and customer data\" --db-path \"inventory.accdb\" --db-name \"Inventory\" --db-desc \"Product inventory database\"")
+    print("SSE with auth: ms-access-mcp --transport sse --cors-origin \"https://myapp.com\" --auth-header \"Bearer your-token-here\" --db-path \"db.accdb\"")
     sys.exit(1)
 
 # Create database registry
@@ -76,6 +82,37 @@ print(f"Default database: {default_db_key}")
 
 # Initialize the MCP server
 server = Server("MS Access Explorer")
+
+class AuthorizationMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, required_auth_header: str = None):
+        super().__init__(app)
+        self.required_auth_header = required_auth_header
+    
+    async def dispatch(self, request: Request, call_next):
+        # Skip auth check if no auth header is required
+        if not self.required_auth_header:
+            return await call_next(request)
+        
+        # Skip auth check for OPTIONS requests (CORS preflight)
+        if request.method == "OPTIONS":
+            return await call_next(request)
+        
+        # Check for Authorization header
+        auth_header = request.headers.get("Authorization")
+        if not auth_header:
+            return JSONResponse(
+                status_code=401,
+                content={"error": "Missing Authorization header"}
+            )
+        
+        # Validate the Authorization header
+        if auth_header != self.required_auth_header:
+            return JSONResponse(
+                status_code=401,
+                content={"error": "Invalid Authorization header"}
+            )
+        
+        return await call_next(request)
 
 def get_database_path(db_name: str = None) -> tuple[str, str]:
     """Get database path and key from name
@@ -1504,10 +1541,15 @@ def create_sse_server():
     
     app = Starlette(routes=routes)
     
+    # Add Authorization middleware if auth header is required
+    if args.auth_header:
+        app.add_middleware(AuthorizationMiddleware, required_auth_header=args.auth_header)
+    
     # Add CORS middleware to allow cross-origin requests
+    cors_origins = [args.cors_origin] if args.cors_origin != "*" else ["*"]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],  # Allow all origins
+        allow_origins=cors_origins,
         allow_credentials=True,
         allow_methods=["*"],  # Allow all methods
         allow_headers=["*", "Authorization"],  # Allow all headers including Authorization
@@ -1538,6 +1580,11 @@ def run():
         asyncio.run(run_stdio())
     elif args.transport == 'sse':
         print(f"Starting MS Access MCP server with SSE transport on {args.host}:{args.port}{args.path}")
+        print(f"CORS origins: {args.cors_origin}")
+        if args.auth_header:
+            print(f"Authorization required: {args.auth_header}")
+        else:
+            print("No authorization required")
         app = create_sse_server()
         uvicorn.run(app, host=args.host, port=args.port)
     else:
