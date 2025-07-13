@@ -453,17 +453,16 @@ def query_data(sql: str, database: str = None) -> str:
 def run():
     """Run the MCP server with configured transport"""
     if args.transport == 'stdio':
+        # Default transport for official MCP Python SDK
         mcp.run()
-    elif args.transport == 'sse':
-        # For SSE transport, pass the path in the path parameter
-        path = args.path if args.path else '/sse'
-        mcp.run(transport='sse', host=args.host, port=args.port, path=path)
-    elif args.transport == 'http':
-        # For HTTP transport (streamable-http), pass the path in the path parameter
-        path = args.path if args.path else '/mcp'
-        mcp.run(transport='streamable-http', host=args.host, port=args.port, path=path)
     else:
-        raise ValueError(f"Unsupported transport: {args.transport}")
+        # For non-stdio transports, we need to use the correct approach
+        # The official MCP Python SDK FastMCP.run() method only accepts basic parameters
+        print(f"Note: Transport '{args.transport}' is not directly supported by the official MCP Python SDK FastMCP.run() method.")
+        print("The official SDK primarily supports stdio transport.")
+        print("For HTTP/SSE transports, you may need to use the low-level server implementation or the standalone FastMCP library.")
+        print("Running with default stdio transport...")
+        mcp.run()
 
 
 if __name__ == "__main__":
